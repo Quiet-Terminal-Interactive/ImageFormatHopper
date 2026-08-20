@@ -200,14 +200,18 @@ def _parse_layer_element(layer_el: ElementTree.Element, blocks: _Blocks, width: 
     )
     layer_width = int(layer_el.get("width", width))
     layer_height = int(layer_el.get("height", height))
+    offset_x = int(layer_el.get("ofsx", "0"))
+    offset_y = int(layer_el.get("ofsy", "0"))
 
     bin_name = layer_el.get("bin")
     logger.debug(
-        "parsing layer %r: bin=%r size=%dx%d mode=%r alpha=%s",
+        "parsing layer %r: bin=%r size=%dx%d offset=(%d,%d) mode=%r alpha=%s",
         layer.name,
         bin_name,
         layer_width,
         layer_height,
+        offset_x,
+        offset_y,
         layer.blend_mode,
         layer_el.get("alpha"),
     )
@@ -223,7 +227,7 @@ def _parse_layer_element(layer_el: ElementTree.Element, blocks: _Blocks, width: 
     if layer_el_id not in (None, "-1"):
         logger.debug("layer %r has non-root parentId=%r (grouping is not modeled)", layer.name, layer_el_id)
     if image is not None:
-        layer.cels[0] = Cel(image=image)
+        layer.cels[0] = Cel(image=image, x=offset_x, y=offset_y)
 
     return layer
 
