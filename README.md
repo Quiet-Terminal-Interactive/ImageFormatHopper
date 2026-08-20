@@ -1,6 +1,6 @@
 # ImageFormatHopper
 
-A tool for converting between image and sprite file formats — PNG, JPEG, GIF, WebP, Aseprite, and FireAlpaca — through a single shared intermediate representation, rather than through a tangle of direct format-to-format conversion routines. Removes the effort of exporting sprites by hand every time an art tool changed its mind about what a `.mdp` file is.
+A tool for converting between image and sprite file formats — PNG, JPEG, GIF, WebP, Aseprite, FireAlpaca, and Krita — through a single shared intermediate representation, rather than through a tangle of direct format-to-format conversion routines. Removes the effort of exporting sprites by hand every time an art tool changed its mind about what a `.mdp` file is.
 
 ```
 imageformathopper sprite.aseprite sprite.gif
@@ -25,10 +25,11 @@ This is the same shape of problem DataFixerUpper solves for schema migration —
 | WebP       | `.webp`             |        |     ✓     |
 | Aseprite   | `.aseprite`, `.ase` |   ✓    |     ✓     |
 | FireAlpaca | `.mdp`              |   ✓    |           |
+| Krita      | `.kra`              |   ✓    |     ✓     |
 
 Converting into a format that can't represent everything the source had is lossy and one-directional: layers are flattened, animations are reduced to their first frame. Nothing is fabricated to compensate, data is preserved wherever the target format allows it, and dropped explicitly where it doesn't.
 
-Aseprite and FireAlpaca support is implemented against reverse-engineered and partial format documentation rather than an official SDK. Aseprite's format is at least documented upstream; FireAlpaca's was recovered by hexdumping sample files and a bit of guesswork. See [`docs/format-breakdowns/`](docs/format-breakdowns) for exactly what each converter reads, what it writes, and what's known versus assumed about the underlying format.
+Aseprite, FireAlpaca, and Krita support is implemented against reverse-engineered and partial format documentation rather than an official SDK. Aseprite's format is at least documented upstream; FireAlpaca's was recovered by hexdumping sample files and a bit of guesswork; Krita's is open source, so its converter is grounded directly in source rather than guesswork, though a couple of narrow details couldn't be pinned down from source alone. See [`docs/format-breakdowns/`](docs/format-breakdowns) for exactly what each converter reads, what it writes, and what's known versus assumed about the underlying format.
 
 ## Installation
 

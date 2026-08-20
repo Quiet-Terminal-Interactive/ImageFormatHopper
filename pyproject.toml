@@ -1,7 +1,7 @@
 [project]
 name = "imageformathopper"
 version = "0.1.0"
-description = "Convert between image/sprite formats (PNG, JPG, GIF, WEBP, Aseprite, FireAlpaca, ...) via a shared intermediate representation."
+description = "Convert between image/sprite formats (PNG, JPG, GIF, WEBP, Aseprite, FireAlpaca, Krita, ...) via a shared intermediate representation."
 requires-python = ">=3.10"
 dependencies = ["Pillow>=12.3.0"]
 
