@@ -1,3 +1,4 @@
+import logging
 import struct
 import zlib
 from pathlib import Path
@@ -6,6 +7,8 @@ from typing import NamedTuple
 from PIL import Image
 
 from ..core import BaseConverter, Cel, Document, Frame, Layer, ParseError, register
+
+logger = logging.getLogger(__name__)
 
 _HEADER_STRUCT = struct.Struct(
     "<"
@@ -154,6 +157,18 @@ def _read_file_header(data: bytes, path: str | Path) -> tuple[int, int, int, int
     if magic != _MAGIC_NUMBER:
         raise ParseError(f"{path}: bad magic number 0x{magic:04x}, not an Aseprite file")
 
+    logger.debug(
+        "file header: declared_size=%d frame_count=%d canvas=%dx%d color_depth=%d actual_size=%d",
+        _file_size,
+        frame_count,
+        width,
+        height,
+        color_depth,
+        len(data),
+    )
+    if _file_size != len(data):
+        logger.debug("declared file size does not match actual size (off by %d bytes)", len(data) - _file_size)
+
     return frame_count, width, height, color_depth
 
 
@@ -163,6 +178,15 @@ def _read_frame_header(data: bytes, offset: int, frame_index: int, path: str | P
         raise ParseError(f"{path}: bad magic number in frame {frame_index}, corrupted Aseprite file.")
 
     chunk_count = new_count if new_count != 0 else old_count
+    logger.debug(
+        "frame %d header at %d: frame_size=%d old_count=%d new_count=%d duration_ms=%d",
+        frame_index,
+        offset,
+        frame_size,
+        old_count,
+        new_count,
+        duration_ms,
+    )
     return frame_size, chunk_count, duration_ms
 
 
@@ -173,6 +197,7 @@ def _parse_layer_chunk(data: bytes, offset: int) -> Layer:
     name_bytes_offset = name_len_offset + 2
     name = data[name_bytes_offset : name_bytes_offset + name_len].decode("utf-8")
 
+    logger.debug("layer chunk: name=%r visible=%s opacity=%d", name, bool(flags & 1), opacity)
     return Layer(name=name, visible=bool(flags & 1), opacity=opacity)
 
 
@@ -188,14 +213,32 @@ def _parse_cel_chunk(data: bytes, offset: int, chunk_end: int) -> _ImageCelChunk
             if cel_type == _CEL_TYPE_RAW_IMAGE
             else zlib.decompress(data[pixel_offset:chunk_end])
         )
+        logger.debug(
+            "cel chunk: layer_index=%d pos=(%d,%d) opacity=%d type=%s size=%dx%d raw_len=%d",
+            layer_index,
+            x,
+            y,
+            opacity,
+            "raw" if cel_type == _CEL_TYPE_RAW_IMAGE else "compressed",
+            width,
+            height,
+            len(raw),
+        )
         return _ImageCelChunk(layer_index, x, y, opacity, width, height, raw)
 
     linked_frame = struct.unpack_from("<H", data, body_offset)[0]
+    logger.debug("cel chunk: layer_index=%d pos=(%d,%d) type=linked linked_frame=%d", layer_index, x, y, linked_frame)
     return _LinkedCelChunk(layer_index, x, y, linked_frame)
 
 
 def _parse_palette_chunk(data: bytes, offset: int, palette: _Palette | None) -> _Palette:
     palette_size, first_index, last_index = _PALETTE_CHUNK_STRUCT.unpack_from(data, offset)[:3]
+    logger.debug(
+        "palette chunk: palette_size=%d first_index=%d last_index=%d",
+        palette_size,
+        first_index,
+        last_index,
+    )
 
     if palette is None:
         palette = [(0, 0, 0, 0)] * palette_size
@@ -241,6 +284,8 @@ def _parse_frame_chunks(
                 linked_cels.append(cel)
         elif chunk_type == _CHUNK_TYPE_PALETTE:
             palette = _parse_palette_chunk(data, chunk_data_start, palette)
+        else:
+            logger.debug("skipping unhandled chunk type 0x%04x (size=%d) at %d", chunk_type, chunk_size, cursor - chunk_size)
 
     return _ParsedFrame(duration_ms, layers, image_cels, linked_cels, palette), cursor
 
@@ -272,6 +317,7 @@ def _decode_cel_image(
 @register("aseprite", extensions=[".aseprite", ".ase"])
 class AsepriteConverter(BaseConverter):
     def read(self, path: str | Path) -> Document:
+        logger.debug("reading Aseprite file: %s", path)
         with open(path, "rb") as f:
             data = f.read()
 
@@ -296,10 +342,24 @@ class AsepriteConverter(BaseConverter):
                     f"expected {expected_end} from the frame header's declared size"
                 )
 
+            logger.debug(
+                "frame %d: %d layer(s), %d image cel(s), %d linked cel(s)",
+                frame_index,
+                len(parsed.layers),
+                len(parsed.image_cels),
+                len(parsed.linked_cels),
+            )
+
             doc.frames.append(Frame(duration_ms=parsed.duration_ms))
             doc.layers.extend(parsed.layers)
 
             for image_cel in parsed.image_cels:
+                if image_cel.layer_index >= len(doc.layers):
+                    logger.debug(
+                        "cel references layer_index=%d but only %d layer(s) exist so far",
+                        image_cel.layer_index,
+                        len(doc.layers),
+                    )
                 image = _decode_cel_image(
                     color_depth, image_cel.width, image_cel.height, image_cel.raw, palette, path
                 )
@@ -314,9 +374,18 @@ class AsepriteConverter(BaseConverter):
             cursor = expected_end
 
         doc.palette = palette
+        logger.debug("finished reading: %d layer(s), %d frame(s)", len(doc.layers), len(doc.frames))
         return doc
 
     def write(self, document: Document, path: str | Path) -> None:
+        logger.debug(
+            "writing Aseprite file: %s (%dx%d, %d layer(s), %d frame(s))",
+            path,
+            document.width,
+            document.height,
+            len(document.layers),
+            len(document.frames),
+        )
         frame_bytes = []
 
         for frame_index, frame in enumerate(document.frames):
@@ -326,11 +395,21 @@ class AsepriteConverter(BaseConverter):
                 for layer in document.layers:
                     chunks.append(_wrap_chunk(_CHUNK_TYPE_LAYER, _build_layer_chunk_body(layer)))
 
+            cel_count = 0
             for layer_index, layer in enumerate(document.layers):
                 cel = layer.cel_at(frame_index)
                 if cel is not None:
                     chunks.append(_wrap_chunk(_CHUNK_TYPE_CEL, _build_cel_chunk_body(cel, layer_index)))
+                    cel_count += 1
 
+            logger.debug(
+                "frame %d: %d chunk(s) (%d layer chunk(s), %d cel chunk(s)), duration_ms=%d",
+                frame_index,
+                len(chunks),
+                len(document.layers) if frame_index == 0 else 0,
+                cel_count,
+                frame.duration_ms,
+            )
             frame_bytes.append(_build_frame_bytes(chunks, frame.duration_ms))
 
         body = b"".join(frame_bytes)
@@ -345,6 +424,7 @@ class AsepriteConverter(BaseConverter):
             32,
         )
         header += b"\x00" * (_FILE_HEADER_SIZE - _HEADER_STRUCT.size)
+        logger.debug("writing header: file_size=%d", file_size)
 
         with open(path, "wb") as f:
             f.write(header + body)

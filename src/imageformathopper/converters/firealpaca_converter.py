@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import struct
 import time
 import zlib
@@ -10,6 +11,8 @@ from xml.etree import ElementTree
 from PIL import Image
 
 from ..core import BaseConverter, Cel, Document, Frame, Layer, ParseError, register
+
+logger = logging.getLogger(__name__)
 
 _FILE_MAGIC = b"mdipack\x00"
 _FILE_HEADER_STRUCT = struct.Struct(
@@ -82,6 +85,19 @@ def _read_file_header(data: bytes, path: str | Path) -> tuple[bytes, int, int]:
     header_size = 8 + _FILE_HEADER_STRUCT.size
     xml_bytes = data[header_size : header_size + xml_len]
     blocks_start = header_size + xml_len
+    logger.debug(
+        "file header: total_bytes=%d xml_len=%d data_len=%d blocks_start=%d expected_end=%d",
+        len(data),
+        xml_len,
+        data_len,
+        blocks_start,
+        blocks_start + data_len,
+    )
+    if blocks_start + data_len != len(data):
+        logger.debug(
+            "header/data_len does not match actual file size (off by %d bytes)",
+            len(data) - (blocks_start + data_len),
+        )
     return xml_bytes, blocks_start, data_len
 
 
@@ -101,6 +117,14 @@ def _read_pac_block(data: bytes, offset: int, path: str | Path) -> _PacBlock:
     name = data[name_offset : name_offset + _PAC_NAME_SIZE].split(b"\x00", 1)[0].decode("utf-8")
     payload_offset = name_offset + _PAC_NAME_SIZE
     payload = data[payload_offset : payload_offset + payload_len]
+    logger.debug(
+        "PAC block at %d: name=%r flag=%d payload_len=%d total_size=%d",
+        offset,
+        name,
+        flag,
+        payload_len,
+        total_size,
+    )
     return _PacBlock(name, flag, payload, total_size)
 
 
@@ -111,6 +135,7 @@ def _read_blocks(data: bytes, start: int, end: int, path: str | Path) -> _Blocks
         block = _read_pac_block(data, cursor, path)
         blocks[block.name] = block
         cursor += block.total_size
+    logger.debug("read %d block(s): %s", len(blocks), sorted(blocks))
     return blocks
 
 
@@ -123,20 +148,46 @@ def _decode_tiled_image(payload: bytes, width: int, height: int) -> Image.Image 
     tile_count, = _TILE_COUNT_STRUCT.unpack_from(payload, 0)
     if tile_count == 0:
         # An empty layer stores only the 4-byte tile_count, no tile_size field
+        logger.debug("tiled layer (%dx%d): tile_count=0, treating as empty", width, height)
         return None
     tile_size = _TILE_HEADER_STRUCT.unpack_from(payload, 0)[1]
+    logger.debug(
+        "tiled layer (%dx%d): tile_count=%d tile_size=%d payload_len=%d",
+        width,
+        height,
+        tile_count,
+        tile_size,
+        len(payload),
+    )
 
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     cursor = _TILE_HEADER_STRUCT.size
-    for _ in range(tile_count):
+    for i in range(tile_count):
         tile_x, tile_y, _reserved, compressed_len = _TILE_RECORD_STRUCT.unpack_from(payload, cursor)
         cursor += _TILE_RECORD_STRUCT.size
         compressed = payload[cursor : cursor + compressed_len]
         cursor += compressed_len + _pad4(compressed_len)
 
+        logger.debug(
+            "  tile %d/%d: grid=(%d,%d) compressed_len=%d cursor=%d",
+            i + 1,
+            tile_count,
+            tile_x,
+            tile_y,
+            compressed_len,
+            cursor,
+        )
         raw = zlib.decompress(compressed)
         tile = _bgra_bytes_to_rgba_image(raw, tile_size, tile_size)
         canvas.paste(tile, (tile_x * tile_size, tile_y * tile_size))
+
+    if cursor != len(payload):
+        logger.debug(
+            "tiled payload has %d trailing byte(s) after last tile (cursor=%d, payload_len=%d)",
+            len(payload) - cursor,
+            cursor,
+            len(payload),
+        )
 
     return canvas.crop((0, 0, width, height))
 
@@ -150,12 +201,27 @@ def _parse_layer_element(layer_el: ElementTree.Element, blocks: _Blocks, width: 
     layer_width = int(layer_el.get("width", width))
     layer_height = int(layer_el.get("height", height))
 
-    block = blocks[layer_el.get("bin")]
+    bin_name = layer_el.get("bin")
+    logger.debug(
+        "parsing layer %r: bin=%r size=%dx%d mode=%r alpha=%s",
+        layer.name,
+        bin_name,
+        layer_width,
+        layer_height,
+        layer.blend_mode,
+        layer_el.get("alpha"),
+    )
+    block = blocks[bin_name]
     image = (
         _decode_flat_image(block.payload, layer_width, layer_height)
         if block.flag == _PAC_FLAG_FLAT
         else _decode_tiled_image(block.payload, layer_width, layer_height)
     )
+    if image is None:
+        logger.debug("layer %r decoded to no image (empty)", layer.name)
+    layer_el_id = layer_el.get("parentId")
+    if layer_el_id not in (None, "-1"):
+        logger.debug("layer %r has non-root parentId=%r (grouping is not modeled)", layer.name, layer_el_id)
     if image is not None:
         layer.cels[0] = Cel(image=image)
 
@@ -213,6 +279,7 @@ def _build_layer_xml(layer: Layer, index: int, bin_name: str, width: int, height
 @register("firealpaca", extensions=[".mdp"])
 class FireAlpacaConverter(BaseConverter):
     def read(self, path: str | Path) -> Document:
+        logger.debug("reading FireAlpaca file: %s", path)
         with open(path, "rb") as f:
             data = f.read()
 
@@ -221,6 +288,7 @@ class FireAlpacaConverter(BaseConverter):
 
         width = int(root.get("width"))
         height = int(root.get("height"))
+        logger.debug("canvas size: %dx%d", width, height)
 
         blocks = _read_blocks(data, blocks_start, blocks_start + data_len, path)
 
@@ -230,12 +298,22 @@ class FireAlpacaConverter(BaseConverter):
         doc.metadata["checker_bg"] = root.get("checkerBG")
 
         layers_el = root.find("Layers")
-        for layer_el in layers_el.findall("Layer") if layers_el is not None else []:
+        layer_els = layers_el.findall("Layer") if layers_el is not None else []
+        logger.debug("found %d <Layer> element(s) in metadata", len(layer_els))
+        for layer_el in layer_els:
             doc.layers.append(_parse_layer_element(layer_el, blocks, width, height))
 
+        logger.debug("finished reading: %d layer(s) built", len(doc.layers))
         return doc
 
     def write(self, document: Document, path: str | Path) -> None:
+        logger.debug(
+            "writing FireAlpaca file: %s (%dx%d, %d layer(s))",
+            path,
+            document.width,
+            document.height,
+            len(document.layers),
+        )
         layer_bins = [f"layer{i}img" for i in range(len(document.layers))]
 
         layer_xml = [
@@ -280,10 +358,19 @@ class FireAlpacaConverter(BaseConverter):
                     piece = piece.copy()
                     piece.putalpha(alpha)
                 image.alpha_composite(piece, dest=(cel.x, cel.y))
+            else:
+                logger.debug("layer %r has no cel at frame 0, writing empty block", layer.name)
             blocks.append(_build_tiled_block(bin_name, image, document.width, document.height))
+            logger.debug("built block %r: %d byte(s)", bin_name, len(blocks[-1]))
 
         data_section = b"".join(blocks)
         header = _FILE_MAGIC + _FILE_HEADER_STRUCT.pack(0, len(xml), len(data_section))
+        logger.debug(
+            "writing header: xml_len=%d data_len=%d total_file_size=%d",
+            len(xml),
+            len(data_section),
+            len(header) + len(xml) + len(data_section),
+        )
 
         with open(path, "wb") as f:
             f.write(header + xml + data_section)
